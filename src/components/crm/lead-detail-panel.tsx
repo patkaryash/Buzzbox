@@ -1,9 +1,10 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Mail, Linkedin, Clock, ChevronLeft, ChevronRight, Check, XCircle, Save, X, Ban, Pause, Play, Trash2, Edit3, Loader2, ChevronDown, ChevronUp, Send, CheckCircle, MessageSquare, Eye, CalendarCheck, Star, CircleDot } from 'lucide-react';
 import { useSmartPoll } from '@/hooks/use-smart-poll';
 import { timeAgo } from '@/lib/utils';
+import { reconcileDetailDraft, shouldClearDirtyAfterSave } from '@/lib/crm-detail-draft';
 import type { Lead, Sequence } from '@/types';
 
 const STAGES = ['new', 'validated', 'approved', 'contacted', 'replied', 'interested', 'booked', 'qualified'] as const;
@@ -51,6 +52,7 @@ export function LeadDetailPanel({
   const [editingNotes, setEditingNotes] = useState(false);
   const [notesValue, setNotesValue] = useState('');
   const [nextAction, setNextAction] = useState('');
+  const [nextActionDirty, setNextActionDirty] = useState(false);
   const [expandedSeq, setExpandedSeq] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [feedback, setFeedback] = useState<{ type: 'success' | 'error'; msg: string } | null>(null);
@@ -78,35 +80,34 @@ export function LeadDetailPanel({
   );
 
   useEffect(() => {
-    if (data?.lead?.notes !== undefined) {
-      setNotesValue(data.lead.notes || '');
-    }
-    if (data?.lead?.next_action_at) {
-      setNextAction(data.lead.next_action_at.split('T')[0]);
-    }
-    if (!editingProfile && data?.lead) {
-      setProfileDraft({
-        first_name: data.lead.first_name || '',
-        last_name: data.lead.last_name || '',
-        title: data.lead.title || '',
-        company: data.lead.company || '',
-        company_size: data.lead.company_size || '',
-        industry_segment: data.lead.industry_segment || '',
-        source: data.lead.source || '',
-        email: data.lead.email || '',
-        linkedin_url: data.lead.linkedin_url || '',
-        score: typeof data.lead.score === 'number' ? String(data.lead.score) : '',
-      });
-    }
-  }, [data?.lead, editingProfile]);
+    if (!data?.lead) return;
+    // Polling must never clobber unsaved edits: dirty/edit-in-progress
+    // fields are skipped, clean fields follow the server.
+    const updates = reconcileDetailDraft(
+      { editingNotes, editingProfile, nextActionDirty },
+      data.lead,
+    );
+    if (updates.notesValue !== undefined) setNotesValue(updates.notesValue);
+    if (updates.nextAction !== undefined) setNextAction(updates.nextAction);
+    if (updates.profileDraft) setProfileDraft(updates.profileDraft);
+  }, [data?.lead, editingNotes, editingProfile, nextActionDirty]);
+
+  // Latest local values, readable when an in-flight save promise resolves
+  // (closures would still hold the click-time value).
+  const notesValueRef = useRef(notesValue);
+  const nextActionRef = useRef(nextAction);
+  useEffect(() => {
+    notesValueRef.current = notesValue;
+    nextActionRef.current = nextAction;
+  }, [notesValue, nextAction]);
 
   function showFeedback(type: 'success' | 'error', msg: string) {
     setFeedback({ type, msg });
     setTimeout(() => setFeedback(null), 2500);
   }
 
-  async function patchLead(updates: Record<string, unknown>) {
-    if (!canEdit) return;
+  async function patchLead(updates: Record<string, unknown>): Promise<boolean> {
+    if (!canEdit) return false;
     setSaving(true);
     try {
       const res = await fetch('/api/crm', {
@@ -118,8 +119,10 @@ export function LeadDetailPanel({
       showFeedback('success', 'Updated');
       setDetailRefresh(k => k + 1);
       onMutate();
+      return true;
     } catch {
       showFeedback('error', 'Failed to update');
+      return false;
     } finally {
       setSaving(false);
     }
@@ -448,12 +451,21 @@ export function LeadDetailPanel({
             <input
               type="date"
               value={nextAction}
-              onChange={e => setNextAction(e.target.value)}
+              onChange={e => { setNextAction(e.target.value); setNextActionDirty(true); }}
               className="bg-muted/30 rounded px-2 py-0.5 text-[10px]"
               disabled={!canEdit || saving}
             />
             <button
-              onClick={() => patchLead({ next_action_at: nextAction ? new Date(`${nextAction}T00:00:00.000Z`).toISOString() : null })}
+              onClick={async () => {
+                const submitted = nextAction;
+                const ok = await patchLead({ next_action_at: submitted ? new Date(`${submitted}T00:00:00.000Z`).toISOString() : null });
+                // The input is disabled while saving, but guard anyway so a
+                // successful save of an older value can never clear the
+                // dirty flag of a newer local edit.
+                if (ok && shouldClearDirtyAfterSave(submitted, nextActionRef.current)) {
+                  setNextActionDirty(false);
+                }
+              }}
               disabled={!canEdit || saving}
               className="btn btn-ghost btn-sm text-[10px]"
               type="button"
@@ -491,7 +503,16 @@ export function LeadDetailPanel({
               <div className="flex items-center gap-2 justify-end">
                 <button onClick={() => setEditingNotes(false)} className="btn btn-ghost btn-sm text-xs" type="button">Cancel</button>
                 <button
-                  onClick={() => { patchLead({ notes: notesValue }); setEditingNotes(false); }}
+                  onClick={async () => {
+                    const submitted = notesValue;
+                    const ok = await patchLead({ notes: submitted });
+                    // The textarea stays editable while the request is in
+                    // flight; only finalize when the user has not typed a
+                    // newer edit past the submitted value.
+                    if (ok && shouldClearDirtyAfterSave(submitted, notesValueRef.current)) {
+                      setEditingNotes(false);
+                    }
+                  }}
                   disabled={!canEdit || saving}
                   className="btn btn-sm text-xs bg-primary/15 text-primary hover:bg-primary/25"
                   type="button"
